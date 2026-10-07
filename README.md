@@ -1,5 +1,45 @@
 # Whop Course Downloader
 
+## Começar no Windows — Content Autopilot
+
+Na pasta deste repositório, execute no PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+powershell -ExecutionPolicy Bypass -File .\download.ps1
+```
+
+O Chromium abrirá no seu computador. Entre na sua conta Whop no próprio
+navegador. A sessão fica em `.whop_browser_data`, somente no seu computador.
+Não envie essa pasta nem URLs assinadas para o GitHub.
+
+Caso a URL antiga não abra o curso, abra uma aula em sua conta e use sua URL:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\download.ps1 -CourseUrl "URL_DA_AULA"
+```
+
+Para atualizar URLs expiradas:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\download.ps1 -Refresh
+```
+
+Vídeos: `content-copilot/downloads/videos/`.
+Manifesto: `content-copilot/downloads/manifest.json`.
+Para transcrever no Gemini, envie os vídeos pela interface do Gemini. Nenhuma
+integração de transcrição foi instalada neste repo.
+
+**Limitação de validação:** download de um MP4 de teste, checkpoints e retomada
+foram verificados. A descoberta de todas as aulas e módulos deste curso ainda
+precisa ser validada na sua sessão. Módulos recolhidos/links não renderizados
+podem não ser descobertos; confira o total antes de considerar a exportação
+completa. Módulos não identificados ficam `null`.
+
+**Dependências:** Python 3.9+, Git e FFmpeg. Se necessário:
+`winget install --id Gyan.FFmpeg -e` e abra um novo terminal.
+
+
 A Python script to download video courses from Whop using browser automation. Supports both automatic and manual navigation modes depending on the course structure.
 
 ## Features
@@ -179,3 +219,26 @@ This project is for educational purposes only. Users are responsible for complyi
 ## Disclaimer
 
 This tool is not affiliated with Whop. Use at your own risk and ensure you have the right to download content from courses you've purchased.
+
+## Work setup
+
+Install with `python -m venv .venv`, `.venv/bin/python -m pip install -e .`,
+and `.venv/bin/python -m playwright install chromium`.
+
+This fork records lesson URLs, detected titles, optional module names, relative
+filenames and per-video download status in `downloads/manifest.json`. Checkpoints
+are written atomically after each capture/download. Authentication files and
+course assets must remain outside git.
+
+Lesson-link navigation replaces the old ArrowRight/manual workflow. Modules stay
+null when the page does not expose them. A page without discoverable lesson links
+captures only its current video and emits a warning; do not treat it as a full
+course export. Extraction against the Content Autopilot account still requires
+an authenticated session and live validation. URLs can expire: use `--force` to
+refresh the cache. No transcription or Gemini API integration is included.
+
+Example after authentication:
+
+```bash
+.venv/bin/whop-downloader download "COURSE_URL" "./content-copilot"
+```

@@ -94,3 +94,9 @@ setup_uvx.sh
 # Downloaded videos
 *.mp4
 *.m3u8
+# Course assets and authentication are local only
+.whop_browser_data/
+downloads/
+logs/
+
+content-copilot/

@@ -26,6 +26,8 @@ import os
 import subprocess
 import sys
 import time
+import re
+from urllib.parse import urlsplit
 from pathlib import Path
 from playwright.async_api import async_playwright
 
@@ -63,6 +65,35 @@ class WhopDownloader:
         self.browser_data_dir = Path.cwd() / ".whop_browser_data"
         self.browser_data_dir.mkdir(exist_ok=True)
 
+    @staticmethod
+    def safe_name(value):
+        name = re.sub(r'[^\w -]', '', str(value)).strip().replace(' ', '_')[:120]
+        return name if name not in ('', '.', '..') else 'Uncategorized'
+
+    def video_path(self, info, index):
+        folder = self.videos_dir
+        if info.get('module'):
+            folder = folder / self.safe_name(info['module'])
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder / f"{index:03d}_{self.safe_name(info['title'])}.mp4"
+
+    def save_progress(self, videos):
+        for i, info in enumerate(videos, 1):
+            path = self.video_path(info, i)
+            info['filename'] = str(path.relative_to(self.target_dir))
+        payloads = {
+            self.downloads_dir / 'video_urls.json': videos,
+            self.downloads_dir / 'manifest.json': {
+                'course_url': self.course_url, 'lessons': videos,
+                'note': 'Module is null when not exposed by the page; verify scan completeness.'
+            },
+        }
+        for path, payload in payloads.items():
+            temp = path.with_suffix('.tmp')
+            temp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
+            temp.chmod(0o600)
+            temp.replace(path)
+
     async def extract_video_urls(self, force_reextract=False):
         """Extract video URLs using iframe navigation approach"""
         urls_file = self.downloads_dir / "video_urls.json"
@@ -82,23 +113,11 @@ class WhopDownloader:
         
         self.logger.info("Starting URL extraction with iframe navigation...")
         
-        # Check if playwright browsers are installed
-        try:
-            subprocess.run(['playwright', 'install', 'chromium'], 
-                         capture_output=True, text=True, check=False)
-        except:
-            self.logger.warning("Could not auto-install Chromium. You may need to run: playwright install chromium")
-        
         async with async_playwright() as p:
             # Launch browser with minimal flags for iframe access
             browser = await p.chromium.launch_persistent_context(
                 user_data_dir=str(self.browser_data_dir),
-                headless=False,
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-web-security',
-                    '--disable-features=IsolateOrigins,site-per-process'
-                ],
+                headless=os.environ.get('WHOP_HEADLESS') == '1',
                 viewport={'width': 1920, 'height': 1080}
             )
             
@@ -108,22 +127,65 @@ class WhopDownloader:
             all_video_urls = {}
             video_data = []
             
-            # Monitor network for Mux video URLs
+            # Capture only successful top-level Mux manifests, not rendition playlists.
+            active_lesson = {}
+
             async def handle_response(response):
-                url = response.url
-                if 'stream.mux.com' in url and '.m3u8' in url:
-                    # Extract video ID and save
-                    video_id = url.split('/')[-1].split('.m3u8')[0].split('?')[0]
+                parsed = urlsplit(response.url)
+                if (response.status == 200 and parsed.hostname == 'stream.mux.com'
+                        and re.fullmatch(r'/[^/]+\.m3u8', parsed.path)):
+                    video_id = parsed.path[1:-6]
+                    if video_id in all_video_urls:
+                        for info in video_data:
+                            if info['video_id'] == video_id and active_lesson:
+                                info.update(active_lesson)
+                                info.update(url=response.url, video_url=response.url)
+                        self.save_progress(video_data)
+                        return
                     if video_id not in all_video_urls:
-                        all_video_urls[video_id] = url
-                        self.logger.info(f"✓ Video #{len(all_video_urls)}: {video_id}")
-            
+                        all_video_urls[video_id] = response.url
+                        info = dict(active_lesson)
+                        info.update(index=len(video_data) + 1, video_id=video_id,
+                                    url=response.url, video_url=response.url,
+                                    downloaded=False)
+                        info.setdefault('lesson_url', page.url)
+                        if not info.get('title'):
+                            headings = response.frame.locator('h1')
+                            info['title'] = (await headings.first.inner_text()).strip() if await headings.count() else 'Untitled_' + video_id[:12]
+                        info.setdefault('module', None)
+                        video_data.append(info)
+                        self.save_progress(video_data)
+                        self.logger.info('Captured video %s', len(video_data))
+
             page.on('response', handle_response)
-            
+
             # Navigate to course
-            await page.goto(self.course_url, wait_until='networkidle', timeout=60000)
+            await page.goto(self.course_url, wait_until='domcontentloaded', timeout=60000)
             await page.wait_for_timeout(3000)
-            
+
+            login_button = page.get_by_role('button', name=re.compile(r'^(Entrar|Log in|Sign in)$', re.I))
+            if await login_button.count() and await login_button.first.is_visible():
+                if os.environ.get('WHOP_HEADLESS') == '1':
+                    self.logger.error('Authentication required; open the visible browser first.')
+                    await browser.close()
+                    return []
+                self.logger.info('Entre na Whop no navegador aberto (até 5 minutos).')
+                try:
+                    await login_button.first.click()
+                    await page.wait_for_function("() => !Array.from(document.querySelectorAll('button')).some(b => /^(Entrar|Log in|Sign in)$/i.test(b.innerText.trim()))", timeout=300000)
+                    # Dismissing a login modal is not proof of login. Reload the requested
+                    # lesson and let the course content determine whether access exists.
+                    await page.goto(self.course_url, wait_until='domcontentloaded', timeout=60000)
+                    await page.wait_for_timeout(5000)
+                    if await login_button.count() and await login_button.first.is_visible():
+                        self.logger.error('A sessão ainda não está autenticada. Execute novamente após entrar.')
+                        await browser.close()
+                        return []
+                except Exception:
+                    self.logger.error('Não foi possível confirmar login no navegador.')
+                    await browser.close()
+                    return []
+
             # Check if we need to navigate to iframe content
             current_url = page.url
             self.logger.info(f"Initial URL: {current_url}")
@@ -164,6 +226,10 @@ class WhopDownloader:
             # Check for login requirement
             current_url = page.url
             if 'login' in current_url or 'signin' in current_url:
+                if os.environ.get('WHOP_HEADLESS') == '1':
+                    self.logger.error('Authentication required; no authenticated session available.')
+                    await browser.close()
+                    return []
                 self.logger.info("Login required. Please log in manually in the browser window.")
                 self.logger.info("Waiting for login completion...")
                 
@@ -191,142 +257,37 @@ class WhopDownloader:
             self.logger.info("Waiting for course content to load...")
             await page.wait_for_timeout(5000)
             
-            # Detect navigation method
-            self.logger.info("Detecting navigation method...")
-            
-            # Test if ArrowRight works
-            initial_url = page.url
-            await page.keyboard.press('ArrowRight')
-            await page.wait_for_timeout(3000)
-            
-            keyboard_nav_works = page.url != initial_url
-            if keyboard_nav_works:
-                self.logger.info("✓ Keyboard navigation (ArrowRight) detected")
-                # Go back to start
-                await page.keyboard.press('ArrowLeft')
-                await page.wait_for_timeout(2000)
-            else:
-                self.logger.info("✗ Keyboard navigation not working")
-            
-            # Start navigation
-            self.logger.info("Starting video extraction...")
-            
-            urls_file = self.downloads_dir / "video_urls.json"
-            navigation_count = 0
-            no_new_videos_count = 0
-            last_video_count = 0
-            max_attempts = 150
-            
-            # If keyboard nav works, use it
-            if keyboard_nav_works:
-                self.logger.info("Using keyboard navigation (ArrowRight key)")
-                
-                for attempt in range(max_attempts):
-                    navigation_count += 1
-                    
-                    # Wait for video to load
-                    await page.wait_for_timeout(2000)
-                    
-                    # Check if we found new videos
-                    if len(all_video_urls) > last_video_count:
-                        last_video_count = len(all_video_urls)
-                        no_new_videos_count = 0
-                        self.logger.info(f"Navigation {navigation_count}: Found {len(all_video_urls)} videos")
-                    else:
-                        no_new_videos_count += 1
-                        if no_new_videos_count % 10 == 0:
-                            self.logger.info(f"Navigation {navigation_count}: {len(all_video_urls)} videos found (no new for {no_new_videos_count} attempts)")
-                    
-                    # Stop if we haven't found new videos in many attempts
-                    if no_new_videos_count > 30 and len(all_video_urls) > 0:
-                        self.logger.info(f"Completed extraction after {no_new_videos_count} attempts without new videos")
-                        self.logger.info(f"✓ Found {len(all_video_urls)} total videos")
-                        break
-                    
-                    # Navigate to next lesson
-                    await page.keyboard.press('ArrowRight')
-                    
-                    # If stuck for too long, try alternative navigation
-                    if no_new_videos_count > 15:
-                        self.logger.info("Trying alternative navigation...")
-                        
-                        # Try clicking on video area to focus it
-                        try:
-                            video_area = await page.query_selector('video, mux-player, [class*="video"], [class*="player"]')
-                            if video_area:
-                                await video_area.click()
-                                await page.wait_for_timeout(500)
-                        except:
-                            pass
-                        
-                        # Try Space key as alternative
-                        await page.keyboard.press('Space')
-                        await page.wait_for_timeout(2000)
-                        
-                        # Reset counter to continue trying
-                        no_new_videos_count = 10
-            else:
-                # Keyboard navigation doesn't work - use manual mode
-                self.logger.info("\n" + "="*60)
-                self.logger.info("MANUAL NAVIGATION MODE")
-                self.logger.info("="*60)
-                self.logger.info("Automatic navigation is not available for this course.")
-                self.logger.info("Please manually click through all lessons in the browser.")
-                self.logger.info("The script will automatically capture video URLs.")
-                self.logger.info("When done, close the browser window.")
-                self.logger.info("="*60 + "\n")
-                
-                # Monitor for manual navigation
-                self.logger.info("Monitoring for videos...")
-                start_time = asyncio.get_event_loop().time()
-                
-                try:
-                    while True:
-                        await page.wait_for_timeout(2000)
-                        
-                        # Check if we found new videos
-                        if len(all_video_urls) > last_video_count:
-                            last_video_count = len(all_video_urls)
-                            self.logger.info(f"✓ Found video #{len(all_video_urls)}")
-                        
-                        # Check if browser is still open
-                        try:
-                            await page.evaluate("1")
-                        except:
-                            self.logger.info("Browser closed by user")
-                            break
-                        
-                        # Status update every 30 seconds
-                        elapsed = asyncio.get_event_loop().time() - start_time
-                        if int(elapsed) % 30 == 0 and int(elapsed) > 0:
-                            self.logger.info(f"Still monitoring... ({len(all_video_urls)} videos found)")
-                        
-                        # Timeout after 10 minutes
-                        if elapsed > 600:
-                            self.logger.info("Timeout after 10 minutes")
-                            break
-                except Exception as e:
-                    # Handle any errors gracefully (like browser being closed)
-                    if "Target closed" in str(e) or "Target page" in str(e):
-                        self.logger.info("Browser window closed - extraction complete")
-                    else:
-                        self.logger.error(f"Unexpected error during monitoring: {e}")
-                    # Continue with the videos we've collected
-            
-            # Convert collected URLs to video_data format
-            for index, (video_id, url) in enumerate(all_video_urls.items(), 1):
-                video_info = {
-                    'title': f'Lesson {index:02d}',
-                    'url': url,
-                    'video_id': video_id,
-                    'index': index
-                }
-                video_data.append(video_info)
-            
-            # Save all video URLs
-            with open(urls_file, 'w') as f:
-                json.dump(video_data, f, indent=2)
-            
+            # Prefer explicit lesson links; keyboard arrows may just seek the video.
+            lessons = []
+            for frame in page.frames:
+                links = await frame.locator('a[href*="/lessons/"], a[href*="lesn_"]').evaluate_all(
+                    "els => els.map(e => ({url: e.href, title: e.innerText.trim()}))")
+                for link in links:
+                    if link['url'] and not any(x['url'] == link['url'] for x in lessons):
+                        lessons.append(link)
+            if not lessons:
+                self.logger.warning('No lesson links found; captured current lesson only. '
+                                    'This is NOT a complete course scan.')
+            for lesson in lessons:
+                active_lesson.clear()
+                active_lesson.update(title=lesson['title'] or 'Untitled',
+                                     lesson_url=lesson['url'], module=None)
+                await page.goto(lesson['url'], wait_until='domcontentloaded', timeout=60000)
+                # Only use explicit module attributes if the course exposes them.
+                for frame in page.frames:
+                    module = frame.locator('[data-module-title]')
+                    if await module.count() == 1:
+                        active_lesson['module'] = await module.get_attribute('data-module-title')
+                    for selector in ('video', 'mux-player'):
+                        players = frame.locator(selector)
+                        if await players.count():
+                            try:
+                                await players.first.evaluate('el => el.play().catch(() => {})')
+                            except Exception:
+                                pass
+                await page.wait_for_timeout(5000)
+            self.save_progress(video_data)
+
             try:
                 await browser.close()
             except:
@@ -340,14 +301,10 @@ class WhopDownloader:
         title = video_info['title']
         url = video_info['url']
         
-        # Create safe filename
-        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip()
-        safe_title = safe_title.replace(' ', '_')
-        
-        output_path = self.videos_dir / f"{index:03d}_{safe_title}.mp4"
-        
+        output_path = self.video_path(video_info, index)
+
         # Skip if already downloaded
-        if output_path.exists():
+        if output_path.exists() and output_path.stat().st_size > 0:
             self.logger.info(f"[{index}/{total}] Already downloaded: {title}")
             return True
         
@@ -365,11 +322,10 @@ class WhopDownloader:
         for format_option in format_options:
             # Build command with current format option
             cmd = [
-                'yt-dlp',
+                sys.executable, '-m', 'yt_dlp',
                 '--no-warnings',
                 '--quiet',
                 '--progress',
-                '--no-check-certificate',
                 '--referer', 'https://whop.com/',
                 '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 '-f', format_option,
@@ -403,11 +359,10 @@ class WhopDownloader:
         # If all formats failed, try one more time with the most permissive settings
         self.logger.info(f"[{index}/{total}] Attempting fallback download...")
         fallback_cmd = [
-            'yt-dlp',
+            sys.executable, '-m', 'yt_dlp',
             '--no-warnings',
             '--quiet',
             '--progress',
-            '--no-check-certificate',
             '--referer', 'https://whop.com/',
             '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             '--merge-output-format', 'mp4',
@@ -445,15 +400,16 @@ class WhopDownloader:
         
         for i, video_info in enumerate(video_data, 1):
             title = video_info['title']
-            safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip()
-            safe_title = safe_title.replace(' ', '_')
-            output_path = self.videos_dir / f"{i:03d}_{safe_title}.mp4"
-            
-            if output_path.exists():
+            output_path = self.video_path(video_info, i)
+
+            if output_path.exists() and output_path.stat().st_size > 0:
+                video_info['downloaded'] = True
                 already_downloaded.append(video_info)
             else:
                 to_download.append((i, video_info))
         
+        self.save_progress(video_data)
+
         # Show summary
         self.logger.info(f"\n=== Download Summary ===")
         self.logger.info(f"Total videos: {len(video_data)}")
@@ -470,6 +426,9 @@ class WhopDownloader:
         failed_downloads = []
         for i, video_info in to_download:
             success = self.download_video(video_info, i, len(video_data))
+            video_info['downloaded'] = success
+            video_info['status'] = 'downloaded' if success else 'failed'
+            self.save_progress(video_data)
             if not success:
                 failed_downloads.append(video_info)
             
