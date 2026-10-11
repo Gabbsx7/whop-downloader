@@ -130,32 +130,47 @@ class WhopDownloader:
             # Capture only successful top-level Mux manifests, not rendition playlists.
             active_lesson = {}
 
+            request_lessons = {}
+            def remember_request(request):
+                if urlsplit(request.url).path.endswith('.m3u8'):
+                    snapshot = dict(active_lesson)
+                    # During Next navigation active_lesson can still describe the old
+                    # page. Bind the stream to the URL at request time, not response time.
+                    snapshot['lesson_url'] = page.url
+                    if active_lesson.get('lesson_url') != page.url:
+                        snapshot.pop('title', None)
+                    request_lessons[request] = snapshot
+            page.on('request', remember_request)
+
             async def handle_response(response):
                 parsed = urlsplit(response.url)
-                if (response.status == 200 and parsed.path.endswith('.m3u8')
-                        and (parsed.hostname != 'stream.mux.com' or re.fullmatch(r'/[^/]+\.m3u8', parsed.path))):
-                    video_id = parsed.hostname + parsed.path.rsplit('.m3u8', 1)[0]
-                    if video_id in all_video_urls:
-                        for info in video_data:
-                            if info['video_id'] == video_id and active_lesson:
-                                info.update(active_lesson)
-                                info.update(url=response.url, video_url=response.url)
+                if response.status != 200 or not parsed.path.endswith('.m3u8'):
+                    return
+                body = await response.text()
+                if not body.lstrip().startswith('#EXTM3U'):
+                    return
+                priority = 2 if '#EXT-X-STREAM-INF' in body else 1
+                snapshot = request_lessons.pop(response.request, {'lesson_url': page.url})
+                lesson_url = snapshot['lesson_url']
+                existing = next((x for x in video_data if x['lesson_url'] == lesson_url), None)
+                if existing is not None:
+                    # Master and rendition playlists describe one lesson, not several videos.
+                    if priority > existing.get('playlist_priority', 0):
+                        existing.update(url=response.url, video_url=response.url, playlist_priority=priority)
                         self.save_progress(video_data)
-                        return
-                    if video_id not in all_video_urls:
-                        all_video_urls[video_id] = response.url
-                        info = dict(active_lesson)
-                        info.update(index=len(video_data) + 1, video_id=video_id,
-                                    url=response.url, video_url=response.url,
-                                    downloaded=False)
-                        info.setdefault('lesson_url', page.url)
-                        if not info.get('title'):
-                            headings = response.request.frame.locator('h1, h2, h3')
-                            info['title'] = (await headings.last.inner_text()).strip() if await headings.count() else 'Untitled_' + video_id[:12]
-                        info.setdefault('module', None)
-                        video_data.append(info)
-                        self.save_progress(video_data)
-                        self.logger.info('Captured video %s', len(video_data))
+                    return
+                video_id = parsed.hostname + parsed.path.rsplit('.m3u8', 1)[0]
+                info = snapshot
+                info.update(index=len(video_data) + 1, video_id=video_id,
+                            url=response.url, video_url=response.url,
+                            playlist_priority=priority, downloaded=False)
+                info.setdefault('title', lesson_url.rstrip('/').split('/')[-1])
+                info.setdefault('module', None)
+                # No await between lookup and insert, so concurrent renditions cannot
+                # append duplicate entries for the same lesson.
+                video_data.append(info)
+                self.save_progress(video_data)
+                self.logger.info('Captured lesson video %s', len(video_data))
 
             pending_responses = set()
             def queue_response(response):
@@ -227,13 +242,24 @@ class WhopDownloader:
                 return False
 
             async def lesson_metadata():
-                for frame in reversed(page.frames):
+                # Player-internal headings can contain "Error NaN" even during playback.
+                for frame in page.frames:
                     headings = frame.locator('h1, h2, h3')
-                    texts = [t.strip() for t in await headings.all_text_contents() if t.strip()]
+                    texts = []
+                    for heading in await headings.all():
+                        if await heading.is_visible():
+                            title = (await heading.inner_text()).strip()
+                            if title and not re.search(r'error|erro|\bNaN\b', title, re.I):
+                                texts.append(title)
                     if texts:
                         return {'title': texts[-1], 'lesson_url': page.url, 'module': None}
-                return {'title': await page.title(), 'lesson_url': page.url, 'module': None}
+                return {'title': page.url.rstrip('/').split('/')[-1], 'lesson_url': page.url, 'module': None}
 
+            def update_captured_metadata():
+                for info in video_data:
+                    if info['lesson_url'] == active_lesson.get('lesson_url'):
+                        info.update(active_lesson)
+                self.save_progress(video_data)
 
             # Navigate to course
             await page.goto(self.course_url, wait_until='domcontentloaded', timeout=60000)
@@ -351,6 +377,7 @@ class WhopDownloader:
                         break
                     active_lesson.clear()
                     active_lesson.update(await lesson_metadata())
+                    update_captured_metadata()
                     before = (page.url, active_lesson['title'])
                     if before in visited:
                         break

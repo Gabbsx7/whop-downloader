@@ -274,3 +274,12 @@ WHOP_LOAD_TIMEOUT=300 python whop_downloader.py download "COURSE_URL" ./group-ca
 
 This is a maximum per wait, not a fixed delay for every lesson. If no stream
 appears, the scan stops as incomplete rather than skipping to the next lesson.
+
+
+### One stream per lesson
+
+Capture is keyed by the lesson URL at request time. HLS master, audio and quality
+playlists are grouped into one lesson entry, preferring the master playlist.
+Player-internal error headings are excluded from lesson titles. This assumes one
+video per lesson, as in Group Call Recordings. After upgrading, use `--force` to
+rebuild earlier URL caches that may contain rendition duplicates.
