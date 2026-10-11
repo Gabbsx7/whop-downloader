@@ -231,9 +231,9 @@ are written atomically after each capture/download. Authentication files and
 course assets must remain outside git.
 
 Lesson-link navigation replaces the old ArrowRight/manual workflow. Modules stay
-null when the page does not expose them. A page without discoverable lesson links
-captures only its current video and emits a warning; do not treat it as a full
-course export. Extraction against the Content Autopilot account still requires
+null when the page does not expose them. Pages without discoverable lesson links use enabled Next/Próximo buttons.
+Always compare captured counts with the course sidebar before treating it as a
+full export. Extraction against the Content Autopilot account still requires
 an authenticated session and live validation. URLs can expire: use `--force` to
 refresh the cache. No transcription or Gemini API integration is included.
 
@@ -241,4 +241,22 @@ Example after authentication:
 
 ```bash
 .venv/bin/whop-downloader download "COURSE_URL" "./content-copilot"
+```
+
+
+### Capture fix for Group Call Recordings
+
+When the course sidebar exposes no anchor links, the scanner starts the current
+player and follows visible enabled Next/Próximo buttons. Stream responses are
+captured in iframes too. Dependencies no longer pin the 2024 Playwright release.
+This flow is tested against a local two-lesson browser fixture; the live course
+still needs validation. Check that all 37 expected recordings are listed.
+
+On WSL, update and run:
+
+```bash
+git pull
+python -m pip install --upgrade playwright yt-dlp
+python -m playwright install chromium
+python whop_downloader.py download "https://whop.com/content-autopilot/exp_AjSt1mt0jHqrTq/app/courses/cors_tjtaBLZBFY80r/lessons/lesn_Cx3NXX0fMsWKf/" ./group-call-recordings --force
 ```

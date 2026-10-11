@@ -132,9 +132,9 @@ class WhopDownloader:
 
             async def handle_response(response):
                 parsed = urlsplit(response.url)
-                if (response.status == 200 and parsed.hostname == 'stream.mux.com'
-                        and re.fullmatch(r'/[^/]+\.m3u8', parsed.path)):
-                    video_id = parsed.path[1:-6]
+                if (response.status == 200 and parsed.path.endswith('.m3u8')
+                        and (parsed.hostname != 'stream.mux.com' or re.fullmatch(r'/[^/]+\.m3u8', parsed.path))):
+                    video_id = parsed.hostname + parsed.path.rsplit('.m3u8', 1)[0]
                     if video_id in all_video_urls:
                         for info in video_data:
                             if info['video_id'] == video_id and active_lesson:
@@ -150,14 +150,54 @@ class WhopDownloader:
                                     downloaded=False)
                         info.setdefault('lesson_url', page.url)
                         if not info.get('title'):
-                            headings = response.frame.locator('h1')
-                            info['title'] = (await headings.first.inner_text()).strip() if await headings.count() else 'Untitled_' + video_id[:12]
+                            headings = response.request.frame.locator('h1, h2, h3')
+                            info['title'] = (await headings.last.inner_text()).strip() if await headings.count() else 'Untitled_' + video_id[:12]
                         info.setdefault('module', None)
                         video_data.append(info)
                         self.save_progress(video_data)
                         self.logger.info('Captured video %s', len(video_data))
 
-            page.on('response', handle_response)
+            pending_responses = set()
+            def queue_response(response):
+                task = asyncio.create_task(handle_response(response))
+                pending_responses.add(task)
+                def response_done(done):
+                    pending_responses.discard(done)
+                    if not done.cancelled() and done.exception():
+                        self.logger.warning('Could not read metadata for a captured response (%s).', type(done.exception()).__name__)
+                task.add_done_callback(response_done)
+            page.on('response', queue_response)
+
+            async def start_and_capture():
+                for frame in page.frames:
+                    # Start real media, including players inside iframes/shadow roots.
+                    for selector in ('video', 'mux-player'):
+                        media = frame.locator(selector)
+                        for player in await media.all():
+                            try:
+                                await player.evaluate('el => { el.muted = true; return el.play().catch(() => {}); }')
+                            except Exception:
+                                pass
+                    play = frame.get_by_role('button', name=re.compile(r'play|reproduzir|assistir', re.I))
+                    for button in await play.all():
+                        if await button.is_visible():
+                            try:
+                                await button.click(timeout=1500)
+                            except Exception:
+                                pass
+                            break
+                await page.wait_for_timeout(8000)
+                if pending_responses:
+                    await asyncio.gather(*list(pending_responses), return_exceptions=True)
+
+            async def lesson_metadata():
+                for frame in reversed(page.frames):
+                    headings = frame.locator('h1, h2, h3')
+                    texts = [t.strip() for t in await headings.all_text_contents() if t.strip()]
+                    if texts:
+                        return {'title': texts[-1], 'lesson_url': page.url, 'module': None}
+                return {'title': await page.title(), 'lesson_url': page.url, 'module': None}
+
 
             # Navigate to course
             await page.goto(self.course_url, wait_until='domcontentloaded', timeout=60000)
@@ -266,26 +306,47 @@ class WhopDownloader:
                     if link['url'] and not any(x['url'] == link['url'] for x in lessons):
                         lessons.append(link)
             if not lessons:
-                self.logger.warning('No lesson links found; captured current lesson only. '
-                                    'This is NOT a complete course scan.')
-            for lesson in lessons:
-                active_lesson.clear()
-                active_lesson.update(title=lesson['title'] or 'Untitled',
-                                     lesson_url=lesson['url'], module=None)
-                await page.goto(lesson['url'], wait_until='domcontentloaded', timeout=60000)
-                # Only use explicit module attributes if the course exposes them.
-                for frame in page.frames:
-                    module = frame.locator('[data-module-title]')
-                    if await module.count() == 1:
-                        active_lesson['module'] = await module.get_attribute('data-module-title')
-                    for selector in ('video', 'mux-player'):
-                        players = frame.locator(selector)
-                        if await players.count():
-                            try:
-                                await players.first.evaluate('el => el.play().catch(() => {})')
-                            except Exception:
-                                pass
-                await page.wait_for_timeout(5000)
+                self.logger.info('No lesson links: using visible Next/Próximo buttons.')
+                visited = set()
+                for step in range(500):
+                    active_lesson.clear()
+                    active_lesson.update(await lesson_metadata())
+                    before = (page.url, active_lesson['title'])
+                    if before in visited:
+                        break
+                    visited.add(before)
+                    self.logger.info('Scanning lesson %s: %s', step + 1, active_lesson['title'])
+                    await start_and_capture()
+                    next_button = None
+                    for frame in page.frames:
+                        candidates = frame.get_by_role('button', name=re.compile(r'^(Próximo|Next)(\s|»|$)', re.I))
+                        for candidate in await candidates.all():
+                            if await candidate.is_visible() and await candidate.is_enabled():
+                                next_button = candidate
+                                break
+                        if next_button is not None:
+                            break
+                    if next_button is None:
+                        break
+                    await next_button.click()
+                    for _ in range(15):
+                        await page.wait_for_timeout(1000)
+                        after = await lesson_metadata()
+                        if (page.url, after['title']) != before:
+                            break
+                    else:
+                        self.logger.warning('Next did not change the lesson. Stopping to avoid repeats.')
+                        break
+            else:
+                for lesson in lessons:
+                    active_lesson.clear()
+                    active_lesson.update(title=lesson['title'] or 'Untitled',
+                                         lesson_url=lesson['url'], module=None)
+                    await page.goto(lesson['url'], wait_until='domcontentloaded', timeout=60000)
+                    await page.wait_for_timeout(3000)
+                    await start_and_capture()
+            if pending_responses:
+                await asyncio.gather(*list(pending_responses), return_exceptions=True)
             self.save_progress(video_data)
 
             try:

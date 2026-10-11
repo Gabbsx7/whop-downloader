@@ -8,8 +8,8 @@ authors = [
     {name = "Whop Downloader"},
 ]
 dependencies = [
-    "playwright==1.48.0",
-    "yt-dlp==2024.10.22",
+    "playwright>=1.48,<2",
+    "yt-dlp>=2024.10.22",
 ]
 
 [project.scripts]
