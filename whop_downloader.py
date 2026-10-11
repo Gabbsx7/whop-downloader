@@ -168,27 +168,63 @@ class WhopDownloader:
                 task.add_done_callback(response_done)
             page.on('response', queue_response)
 
+            load_timeout = max(10, int(os.environ.get('WHOP_LOAD_TIMEOUT', '180')))
+
+            async def wait_for_player():
+                deadline = time.monotonic() + load_timeout
+                last_report = 0
+                while time.monotonic() < deadline:
+                    for frame in page.frames:
+                        try:
+                            players = frame.locator('video, mux-player')
+                            for player in await players.all():
+                                if await player.is_visible():
+                                    return True
+                            buttons = frame.get_by_role('button', name=re.compile(r'play|reproduzir|assistir', re.I))
+                            for button in await buttons.all():
+                                if await button.is_visible():
+                                    return True
+                        except Exception:
+                            # Frames may detach while the course application loads.
+                            continue
+                    elapsed = load_timeout - int(deadline - time.monotonic())
+                    if elapsed >= last_report + 15:
+                        self.logger.info('Waiting for player: %ss / %ss. You may press Play manually.', elapsed, load_timeout)
+                        last_report = elapsed
+                    await page.wait_for_timeout(1000)
+                self.logger.error('Player did not appear within %ss; course scan is incomplete.', load_timeout)
+                return False
+
             async def start_and_capture():
-                for frame in page.frames:
-                    # Start real media, including players inside iframes/shadow roots.
-                    for selector in ('video', 'mux-player'):
-                        media = frame.locator(selector)
-                        for player in await media.all():
-                            try:
-                                await player.evaluate('el => { el.muted = true; return el.play().catch(() => {}); }')
-                            except Exception:
-                                pass
-                    play = frame.get_by_role('button', name=re.compile(r'play|reproduzir|assistir', re.I))
-                    for button in await play.all():
-                        if await button.is_visible():
-                            try:
-                                await button.click(timeout=1500)
-                            except Exception:
-                                pass
-                            break
-                await page.wait_for_timeout(8000)
-                if pending_responses:
-                    await asyncio.gather(*list(pending_responses), return_exceptions=True)
+                clicked_frames = set()
+                deadline = time.monotonic() + load_timeout
+                last_report = 0
+                while time.monotonic() < deadline:
+                    for frame in page.frames:
+                        try:
+                            for selector in ('video', 'mux-player'):
+                                for player in await frame.locator(selector).all():
+                                    # Do not toggle playback off on a second poll.
+                                    await player.evaluate('el => { el.muted = true; if (el.paused !== false) { const p = el.play(); if (p) p.catch(() => {}); } }')
+                            buttons = frame.get_by_role('button', name=re.compile(r'^(play|reproduzir|assistir)(\s|$)', re.I))
+                            for button in await buttons.all():
+                                if frame not in clicked_frames and await button.is_visible():
+                                    await button.click(timeout=1500)
+                                    clicked_frames.add(frame)
+                                    break
+                        except Exception:
+                            continue
+                    await page.wait_for_timeout(1000)
+                    if pending_responses:
+                        await asyncio.gather(*list(pending_responses), return_exceptions=True)
+                    if any(info.get('lesson_url') == active_lesson.get('lesson_url') for info in video_data):
+                        return True
+                    elapsed = load_timeout - int(deadline - time.monotonic())
+                    if elapsed >= last_report + 15:
+                        self.logger.info('Waiting for video stream: %ss / %ss. Press Play if needed.', elapsed, load_timeout)
+                        last_report = elapsed
+                self.logger.error('No video stream captured after %ss; stopping before the next lesson.', load_timeout)
+                return False
 
             async def lesson_metadata():
                 for frame in reversed(page.frames):
@@ -295,8 +331,10 @@ class WhopDownloader:
             
             # Wait for first video to load
             self.logger.info("Waiting for course content to load...")
-            await page.wait_for_timeout(5000)
-            
+            if not await wait_for_player():
+                await browser.close()
+                return video_data
+
             # Prefer explicit lesson links; keyboard arrows may just seek the video.
             lessons = []
             for frame in page.frames:
@@ -309,6 +347,8 @@ class WhopDownloader:
                 self.logger.info('No lesson links: using visible Next/Próximo buttons.')
                 visited = set()
                 for step in range(500):
+                    if not await wait_for_player():
+                        break
                     active_lesson.clear()
                     active_lesson.update(await lesson_metadata())
                     before = (page.url, active_lesson['title'])
@@ -316,7 +356,8 @@ class WhopDownloader:
                         break
                     visited.add(before)
                     self.logger.info('Scanning lesson %s: %s', step + 1, active_lesson['title'])
-                    await start_and_capture()
+                    if not await start_and_capture():
+                        break
                     next_button = None
                     for frame in page.frames:
                         candidates = frame.get_by_role('button', name=re.compile(r'^(Próximo|Next)(\s|»|$)', re.I))
@@ -329,7 +370,7 @@ class WhopDownloader:
                     if next_button is None:
                         break
                     await next_button.click()
-                    for _ in range(15):
+                    for _ in range(load_timeout):
                         await page.wait_for_timeout(1000)
                         after = await lesson_metadata()
                         if (page.url, after['title']) != before:
@@ -343,8 +384,10 @@ class WhopDownloader:
                     active_lesson.update(title=lesson['title'] or 'Untitled',
                                          lesson_url=lesson['url'], module=None)
                     await page.goto(lesson['url'], wait_until='domcontentloaded', timeout=60000)
-                    await page.wait_for_timeout(3000)
-                    await start_and_capture()
+                    if not await wait_for_player():
+                        break
+                    if not await start_and_capture():
+                        break
             if pending_responses:
                 await asyncio.gather(*list(pending_responses), return_exceptions=True)
             self.save_progress(video_data)

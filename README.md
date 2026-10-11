@@ -260,3 +260,17 @@ python -m pip install --upgrade playwright yt-dlp
 python -m playwright install chromium
 python whop_downloader.py download "https://whop.com/content-autopilot/exp_AjSt1mt0jHqrTq/app/courses/cors_tjtaBLZBFY80r/lessons/lesn_Cx3NXX0fMsWKf/" ./group-call-recordings --force
 ```
+
+
+### Slow course pages
+
+The scanner waits for visible media or a Play button, then waits for a captured
+stream before advancing. Each wait defaults to 180 seconds, with progress logs.
+For slower pages on WSL, use:
+
+```bash
+WHOP_LOAD_TIMEOUT=300 python whop_downloader.py download "COURSE_URL" ./group-call-recordings --force
+```
+
+This is a maximum per wait, not a fixed delay for every lesson. If no stream
+appears, the scan stops as incomplete rather than skipping to the next lesson.
